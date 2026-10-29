@@ -1,0 +1,61 @@
+# Korean training using the Whisper BPE vocabulary extension.
+# Use original word alignment times with Whisper-medium BPE; no Whisper model.
+data:
+  train_data: data/korean/moshi_train.jsonl
+  eval_data: data/korean/moshi_eval.jsonl
+  shuffle: true
+
+moshi_paths:
+  hf_repo_id: kyutai/moshiko-pytorch-bf16
+
+# Automatically created before model loading if missing; existing mappings are validated.
+korean_vocab: korean_vocab_medium_words.json
+korean_overflow: error
+korean_auto_prepare: true
+korean_alignment_mode: existing_words
+whisper_tokenizer_dir: tokenizers/whisper-medium
+korean_alignment_cache: data/korean_alignment_cache
+# Include eval token inventory only, never eval examples in optimizer updates.
+korean_vocab_include_eval: true
+korean_speaker: ASSISTANT
+korean_channel: 0
+whisper_model: medium  # Used only if korean_alignment_mode is whisper_dtw.
+# No Whisper model is loaded in existing_words mode.
+whisper_device: cpu
+whisper_num_languages: 99
+
+# Joint text/audio training with LoRA and trainable vocabulary parameters.
+full_finetuning: false
+lora:
+  enable: true
+  rank: 128
+  scaling: 2.0
+  ft_embed: false
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+# Fixed 200-second segments (2,500 Mimi frames); shorter final segments are padded.
+duration_sec: 200
+batch_size: 4
+num_microbatches: 1
+max_steps: 1000
+gradient_checkpointing: true
+optim:
+  lr: 2.0e-5
+  weight_decay: 0.1
+  pct_start: 0.14
+
+seed: 0
+log_freq: 1
+# Evaluation uses at most 40 batches globally; max_eval_samples is unsupported.
+do_eval: true
+eval_freq: 50
+do_ckpt: true
+ckpt_freq: 50
+num_ckpt_keep: null
+save_adapters: true
+run_dir: runs/moshi_7B_single_gpu_whisper_ko_1000
+overwrite_run_dir: false
+wandb:
+  project: null
+  offline: false

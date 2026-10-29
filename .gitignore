@@ -105,4 +105,12 @@ cython_debug/
 
 example/debug_configs/
 
+# Local training outputs and downloaded tokenizer assets
+/runs/
+/runs_whisper_vocab/
+/tokenizers/
+/data/korean_alignment_cache/
+/korean_vocab*.json
+.pytest_cache/
+
 

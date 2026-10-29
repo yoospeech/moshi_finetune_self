@@ -78,6 +78,19 @@ class TrainArgs(Serializable):
     # Number of steps to accumulate gradients before doing an optimizer step.
     num_microbatches: int = 1
 
+    korean_vocab: str | None = None
+    korean_overflow: str = "error"
+    korean_auto_prepare: bool = False
+    korean_alignment_mode: str = "whisper_dtw"
+    whisper_tokenizer_dir: str | None = None
+    korean_alignment_cache: str = "data/korean_alignment_cache"
+    korean_vocab_include_eval: bool = False
+    korean_speaker: str = "ASSISTANT"
+    korean_channel: int = 0
+    whisper_model: str = "small"
+    whisper_device: str = "cpu"
+    whisper_num_languages: int = 99
+
     duration_sec: float = 10
     batch_size: int = 1
     max_norm: float = 1.0  # Gradient clipping.

@@ -21,11 +21,17 @@ def compute_loss_with_mask(
         for id in text_padding_ids:
             weights[target == id] *= text_padding_weight
 
-    logits = logits.view(-1, logits.size(-1)).float()
-    target = target.view(-1)
-    weights = weights.view(-1)
-    mb_loss = F.cross_entropy(logits, target, reduction="none")
-    mb_loss = torch.where(weights > 0.0, mb_loss * weights, torch.zeros_like(mb_loss))
-    mb_loss = torch.sum(mb_loss) / torch.sum(weights)
-
-    return mb_loss
+    # Moshi deliberately fills invalid delayed positions with NaN. Exclude
+    # them BEFORE cross entropy; masking the loss afterwards can poison gradients.
+    logits = logits.reshape(-1, logits.size(-1)).float()
+    target = target.reshape(-1)
+    weights = weights.reshape(-1)
+    selected = weights > 0
+    logits, target, weights = logits[selected], target[selected], weights[selected]
+    if weights.numel() == 0:
+        # Differentiable zero without reading any invalid logit values.
+        return logits.sum()
+    losses = F.cross_entropy(logits, target, reduction="none")
+    if not torch.isfinite(losses).all():
+        raise FloatingPointError(f"Nonfinite {mode} loss at an unmasked target")
+    return (losses * weights).sum() / weights.sum()

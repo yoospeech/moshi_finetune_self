@@ -13,6 +13,7 @@ from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp.api import ShardingStrategy
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
 
+from .korean import KoreanVocabulary, expand_vocabulary, vocabulary_parameter
 from .args import TrainArgs
 from .distributed import get_rank, get_world_size
 
@@ -124,7 +125,7 @@ def get_fsdp_model(
             dtype=param_dtype,
             lm_kwargs_overrides={
                 "gradient_checkpointing": args.gradient_checkpointing,
-                "lora": args.lora.enable,
+                "lora": args.lora.enable and not args.korean_vocab,
                 "lora_rank": args.lora.rank,
                 "lora_scaling": args.lora.scaling,
             },
@@ -144,7 +145,7 @@ def get_fsdp_model(
 
         model.load_state_dict(model_state_dict, strict=False, assign=True)
 
-        if args.lora.enable and not args.full_finetuning:
+        if args.lora.enable and not args.full_finetuning and not args.korean_vocab:
             logger.info("Initializing lora layers ...")
             # initialize LoRA layers
             initialize_lora_parameters(model, param_dtype)
@@ -168,12 +169,24 @@ def get_fsdp_model(
             "All parameters should be on meta"
         )
 
+    if args.korean_vocab:
+        from moshi.modules.lora import replace_all_linear_with_lora
+        from .korean import install_vocabulary
+        vocabulary = KoreanVocabulary.load(args.korean_vocab)
+        expand_vocabulary(model, vocabulary, args.seed)
+        if args.lora.enable:
+            replace_all_linear_with_lora(model, args.lora.rank, args.lora.scaling)
+            install_vocabulary(model, vocabulary)
+            for name, module in model.named_modules():
+                if name.endswith("lora_B") and not module.weight.is_meta:
+                    torch.nn.init.zeros_(module.weight)
+
     torch.distributed.barrier()
 
     # only finetune LoRA parameters and freeze before wrapping
     if args.lora.enable and not args.full_finetuning:
         for name, param in model.named_parameters():
-            if "lora" in name:
+            if "lora" in name or (args.korean_vocab and vocabulary_parameter(name)):
                 param.requires_grad = True
             elif args.lora.ft_embed and "emb" in name:
                 param.requires_grad = True

@@ -137,10 +137,22 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         loaders._lm_kwargs
         if checkpoint_info.raw_config is None
         else checkpoint_info.raw_config
-    )
+    ).copy()
     lm_config["lora"] = args.lora.enable
     lm_config["lora_rank"] = args.lora.rank
     lm_config["lora_scaling"] = args.lora.scaling
+
+    if args.korean_auto_prepare:
+        from finetune.korean_cache import ensure_vocabulary
+        error = [None]
+        if get_rank() == 0:
+            try:
+                ensure_vocabulary(args, lm_config["text_card"])
+            except Exception as exc:
+                error[0] = str(exc)
+        dist.broadcast_object_list(error, src=0)
+        if error[0] is not None:
+            raise ValueError(f"Korean vocabulary preparation failed: {error[0]}")
 
     mimi = checkpoint_info.get_mimi(device="cuda")
     mimi.eval()
@@ -149,6 +161,13 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
     # 4.2 Load and shard model, prepare interleaver for audio/text tokens.
     model = get_fsdp_model(args, checkpoint_info)
+
+    vocabulary = None
+    if args.korean_vocab:
+        from finetune.korean import KoreanVocabulary
+        vocabulary = KoreanVocabulary.load(args.korean_vocab)
+        lm_config["text_card"] = vocabulary.text_card
+        lm_config["text_card_out"] = vocabulary.text_card
 
     spm = checkpoint_info.get_text_tokenizer()
 
@@ -159,9 +178,24 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         model.end_of_text_padding_id,
         model.zero_token_id,
         keep_main_only=True,
+        korean_vocabulary=vocabulary,
+        korean_overflow=args.korean_overflow,
     )
+    alignment_cache = None
+    if args.korean_auto_prepare:
+        if args.korean_alignment_mode == "existing_words":
+            from finetune.korean_words import KoreanWordAlignment
+            alignment_cache = KoreanWordAlignment(vocabulary)
+        else:
+            from finetune.korean_cache import KoreanAlignmentCache
+            alignment_cache = KoreanAlignmentCache(
+                args.korean_alignment_cache, vocabulary,
+                model=args.whisper_model, device=args.whisper_device,
+                speaker=args.korean_speaker, channel=args.korean_channel,
+            )
     interleaved_tokenizer = InterleavedTokenizer(
-        mimi, interleaver, duration_sec=args.duration_sec
+        mimi, interleaver, duration_sec=args.duration_sec,
+        alignment_cache=alignment_cache,
     )
 
     # 5. Load data loaders
@@ -174,17 +208,6 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         world_size=get_world_size(),  # DDP world_size
         is_eval=False,
     )
-
-    if args.do_eval:
-        eval_data_loader = build_data_loader(
-            instruct_tokenizer=interleaved_tokenizer,
-            args=args.data,
-            batch_size=args.batch_size,
-            seed=None,
-            rank=get_rank(),  # DDP rank
-            world_size=get_world_size(),  # DDP world_size
-            is_eval=True,
-        )
 
     # 6. Load model
     # Define mixed precision
@@ -221,6 +244,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             optimizer=optimizer,
             num_ckpt_keep=args.num_ckpt_keep,
             full_finetuning=args.full_finetuning,
+            korean_vocabulary=vocabulary,
         )
     # 9. Prepare mixed precision
     prepare_mixed_precision(
@@ -316,6 +340,12 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             (args.eval_freq > 0 and state.step % args.eval_freq == 0) or is_last_step
         ):
             # write perplexity to state
+            # Evaluation iterators are finite: recreate for every evaluation.
+            eval_data_loader = build_data_loader(
+                instruct_tokenizer=interleaved_tokenizer,
+                args=args.data, batch_size=args.batch_size, seed=None,
+                rank=get_rank(), world_size=get_world_size(), is_eval=True,
+            )
             evaluate(model, eval_data_loader, state, args)
 
             eval_logs = get_eval_logs(

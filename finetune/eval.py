@@ -1,4 +1,5 @@
 import logging
+import itertools
 from typing import Iterator
 
 import torch
@@ -27,15 +28,14 @@ def evaluate(
     state: TrainState,
     args: TrainArgs,
 ):
-    num_samples = torch.tensor([0], device="cuda", dtype=torch.long)
+    device = next(model.parameters()).device
+    num_samples = torch.tensor(0, device=device, dtype=torch.long)
 
-    text_loss = torch.tensor(0.0).cuda()
-    audio_loss = torch.tensor(0.0).cuda()
+    text_loss = torch.tensor(0.0, device=device)
+    audio_loss = torch.tensor(0.0, device=device)
     model.eval()
-    for batch in eval_data_loader:
+    for batch in itertools.islice(eval_data_loader, max(1, 40 // get_world_size())):
         num_samples += 1
-        if num_samples > 40 // get_world_size():
-            break
         with torch.no_grad():
             codes = batch.codes
             condition_tensors = None
@@ -64,11 +64,11 @@ def evaluate(
                 first_codebook_weight_multiplier=args.first_codebook_weight_multiplier,
             )
     eval_loss = text_loss + audio_loss
-    all_num_samples = [torch.zeros_like(num_samples) for _ in range(get_world_size())]
-
-    torch.distributed.all_gather(all_num_samples, num_samples)
-
-    total_num_samples = int(torch.tensor(all_num_samples).sum().item())
+    dist.all_reduce(num_samples, op=dist.ReduceOp.SUM)
+    total_num_samples = int(num_samples.item())
+    if total_num_samples == 0:
+        model.train()
+        raise ValueError("Validation produced no batches; check eval manifest and batch_size")
     # sum loss
     main_logger_info("Eval finished!")
 
@@ -80,7 +80,7 @@ def evaluate(
     eval_loss /= total_num_samples
 
     state.this_eval_loss = eval_loss.item()
-    state.this_eval_perplexity = (2**eval_loss).item()
+    state.this_eval_perplexity = torch.exp(eval_loss).item()
     state.this_audio_loss = audio_loss.item()
     state.this_text_loss = text_loss.item()
 

@@ -33,7 +33,9 @@ class Checkpointer:
         optimizer: torch.optim.Optimizer | None = None,
         num_ckpt_keep: int | None = None,
         full_finetuning: bool = False,
+        korean_vocabulary=None,
     ):
+        self.korean_vocabulary = korean_vocabulary
         self.model = model
         self.optimizer = optimizer
         self.state = state
@@ -80,6 +82,8 @@ class Checkpointer:
         return ckpts_to_delete
 
     def write_params_info(self, tmp_dst: Path):
+        if self.korean_vocabulary is not None:
+            self.korean_vocabulary.save(tmp_dst / "korean_vocabulary.json")
         params_path = tmp_dst / "config.json"
         with open(params_path, "w") as f:
             f.write(json.dumps(self.config, indent=4))
@@ -193,6 +197,14 @@ class Checkpointer:
                 states = self.get_non_lora_states(self.model.state_dict())
                 states = {k: v.clone().to(dtype=save_dtype) for k, v in states.items()}
 
+        if save_only_lora and self.korean_vocabulary is not None:
+            from .korean import vocabulary_parameter
+            from contextlib import nullcontext
+            context = self.model.summon_full_params(self.model, writeback=False, offload_to_cpu=True) if get_world_size() > 1 else nullcontext()
+            with context:
+                for key, value in self.model.state_dict().items():
+                    if vocabulary_parameter(key):
+                        states[key] = value.detach().clone().to(dtype=save_dtype)
         states = dict(sorted(states.items()))
         return states
 

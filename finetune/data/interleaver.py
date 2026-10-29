@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from functools import reduce
@@ -87,7 +88,14 @@ class Interleaver:
         audio_delay: float = 0.0,
         proba: float = 1.0,
         device: str | torch.device = "cuda",
+        korean_vocabulary=None,
+        korean_overflow: str = "error",
     ):
+        self.korean_vocabulary = korean_vocabulary
+        if korean_overflow not in {"error", "warn"}:
+            raise ValueError("korean_overflow must be error or warn")
+        self.korean_overflow = korean_overflow
+        self.korean_stats = {}
         self.tokenizer = tokenizer
         self.audio_frame_rate = audio_frame_rate
         self.text_padding = text_padding
@@ -209,6 +217,59 @@ class Interleaver:
             text_tokens[:prefix_length] = [self.zero_padding] * prefix_length
         return torch.tensor(text_tokens, device=self.device).view(1, 1, -1)
 
+    def prepare_korean(self, tokens, start_sec, num_frames, main_speaker=None):
+        """Absolute timestamps, half-open segment ownership by token start.
+
+        Stable start-time ordering resolves overlap. Queue overflow is fatal by
+        default; warn mode exposes counts and an explicit warning.
+        """
+        if self.korean_vocabulary is None:
+            raise ValueError("Korean token records require korean_vocab")
+        if self.audio_frame_rate != 12.5:
+            raise ValueError("Korean alignment requires Mimi at 12.5 Hz")
+        if self.audio_delay != 0 or self.use_bos_eos:
+            raise ValueError("Korean path currently requires zero delay and no turn BOS/EOS")
+        mapping = self.korean_vocabulary.mapping
+        stats = dict(tokens=0, collisions=0, shifted=0, dropped=0, filtered=0)
+        stream = [self.text_padding] * num_frames
+        next_free, occupied = 0, set()
+        end = start_sec + num_frames / self.audio_frame_rate
+        for token in sorted(tokens, key=lambda t: t["start"]):
+            start, stop = float(token["start"]), float(token["end"])
+            if not math.isfinite(start) or not math.isfinite(stop) or start < 0 or stop < start:
+                raise ValueError(f"Invalid token timestamp: {token}")
+            placement = token.get("moshi_frame")
+            owner_time = start if placement is None else placement / self.audio_frame_rate
+            if not start_sec <= owner_time < end:
+                continue
+            if self.keep_main_only and token.get("speaker", self.main_speaker_label) != (main_speaker or self.main_speaker_label):
+                stats["filtered"] += 1
+                continue
+            token_id = mapping[token["whisper_token_id"]]  # unknown IDs fail loudly
+            frame = min(num_frames - 1, math.floor((owner_time - start_sec) * self.audio_frame_rate + 1e-8))
+            stats["tokens"] += 1
+            stats["collisions"] += int(token.get("frame_collision", frame in occupied))
+            occupied.add(frame)
+            target = max(frame, next_free)
+            stats["shifted"] += int(token.get("frame_shifted", target != frame))
+            if target >= num_frames:
+                stats["dropped"] += 1
+                continue
+            if target > 0 and stream[target - 1] in {self.text_padding, self.in_word_padding}:
+                stream[target - 1] = self.end_of_text_padding
+            stream[target] = token_id
+            next_free = target + 1
+            stop_frame = min(num_frames, math.floor((stop - start_sec) * self.audio_frame_rate) + 1)
+            for index in range(next_free, stop_frame):
+                stream[index] = self.in_word_padding
+        self.korean_stats = stats
+        if stats["dropped"]:
+            message = f"Korean frame capacity exceeded: {stats} (segment start={start_sec})"
+            if self.korean_overflow == "error":
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning)
+        return torch.tensor(stream, device=self.device).view(1, 1, -1)
+
     def prepare_item(
         self,
         alignments: list[Alignment] | None,
@@ -245,15 +306,20 @@ def dicho(alignment, val, i=0, j=None):
 
 
 class InterleavedTokenizer:
-    def __init__(self, mimi, interleaver, duration_sec: float):
+    def __init__(self, mimi, interleaver, duration_sec: float, alignment_cache=None):
+        self.alignment_cache = alignment_cache
         self.mimi = mimi
         self.interleaver = interleaver
         self.duration_sec = duration_sec
+        if interleaver.korean_vocabulary is not None and not math.isclose(duration_sec * mimi.frame_rate, round(duration_sec * mimi.frame_rate)):
+            raise ValueError("Korean segment duration must be a multiple of 80ms")
         self.num_audio_frames = math.ceil(duration_sec * mimi.frame_rate)
 
     def __call__(self, wav: np.ndarray, start_sec: float, path: str) -> Sample:
         with torch.no_grad():
-            audio_tensor = torch.Tensor(wav).cuda()
+            if wav.ndim != 2 or wav.shape[0] != 2:
+                raise ValueError("Expected stereo audio with original channel order")
+            audio_tensor = torch.as_tensor(wav, device=self.interleaver.device)
             audio_tokens = self.mimi.encode(audio_tensor[:, None])
             audio_tokens = audio_tokens[..., : self.num_audio_frames]
             this_num_audio_frames = audio_tokens.shape[-1]
@@ -267,23 +333,33 @@ class InterleavedTokenizer:
             info_file = os.path.splitext(path)[0] + ".json"
             with open(info_file) as f:
                 data = json.load(f)
+            if self.alignment_cache is not None:
+                data = self.alignment_cache(path, data)
+            if "tokens" in data:
+                vocabulary = self.interleaver.korean_vocabulary
+                if vocabulary is None or data.get("num_languages", vocabulary.num_languages) != vocabulary.num_languages:
+                    raise ValueError("Missing or incompatible Korean vocabulary")
+                text_tokens = self.interleaver.prepare_korean(
+                    data["tokens"], start_sec, this_num_audio_frames
+                )
+            else:
                 alignments = data["alignments"]
-
-            start_alignment = dicho(alignments, start_sec)
-            end_alignment = dicho(alignments, start_sec + self.duration_sec)
-            alignments = [
-                (a[0], (a[1][0] - start_sec, a[1][1] - start_sec), a[2])
-                for a in alignments[start_alignment:end_alignment]
-            ]
-
-            text_tokens = self.interleaver.prepare_item(
-                alignments, this_num_audio_frames
-            )
+                start_alignment = dicho(alignments, start_sec)
+                end_alignment = dicho(alignments, start_sec + self.duration_sec)
+                alignments = [
+                    (a[0], (a[1][0] - start_sec, a[1][1] - start_sec), a[2])
+                    for a in alignments[start_alignment:end_alignment]
+                ]
+                text_tokens = self.interleaver.prepare_item(
+                    alignments, this_num_audio_frames / self.mimi.frame_rate
+                )
             text_tokens = torch.nn.functional.pad(
                 text_tokens,
                 (0, self.num_audio_frames - text_tokens.shape[-1]),
                 value=self.interleaver.zero_padding,
             )
 
+            if text_tokens.shape[-1] != audio_tokens.shape[-1]:
+                raise ValueError("Text/audio frame count mismatch")
             codes = torch.cat([text_tokens, audio_tokens], dim=1)
             return Sample(codes, data.get("text_conditions", None))

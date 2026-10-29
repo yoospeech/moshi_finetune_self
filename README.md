@@ -269,3 +269,9 @@ For more details on how to use wandb, visit the [Weights and Biases documentatio
 ## Acknowledgments
 
 This project uses code from [mistral-finetune](https://github.com/mistralai/mistral-finetune) licensed under the Apache License 2.0.
+
+## Korean Whisper vocabulary extension
+
+An opt-in Korean path adds corpus-selected Whisper BPE IDs and token-level DTW
+alignment while retaining Helium, Depth, and Mimi. See [setup, tests, statistics,
+and compatibility limits](docs/korean.md).
